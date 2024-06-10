@@ -1,7 +1,10 @@
 public class SaltoExternalIdService {
     private static final String SALTO_ID_FIELD_API_NAME = 'SaltoId__c';
+    private static final String SALTO_ID_FIELD_DEVELOPER_NAME = SALTO_ID_FIELD_API_NAME.replaceAll('__c', '');
     private static final String SALTO_ID_FIELD_LABEL = 'Salto ID';
     private static final Double API_VERSION = 60.0;
+
+    private static final String TRIGGER_SUFFIX = 'SaltoIdTrigger';
 
     private static MetadataService.MetadataPort createService() { 
 		MetadataService.MetadataPort service = new MetadataService.MetadataPort();
@@ -10,21 +13,13 @@ public class SaltoExternalIdService {
 		return service;		
 	}
 
-    private static Set<String> getObjectsWithSaltoIdField () {
-        MetadataService.MetadataPort service = createService();
-        List<MetadataService.ListMetadataQuery> queries = new List<MetadataService.ListMetadataQuery>();		
-		MetadataService.ListMetadataQuery customFieldQuery = new MetadataService.ListMetadataQuery();
-		customFieldQuery.type_x = 'CustomField';
-		queries.add(customFieldQuery);
-        Set<String> customFieldsFullNames = new Set<String>();
-        MetadataService.FileProperties[] fileProperties = service.listMetadata(queries, 25);
+    public static Set<String> getObjectsWithSaltoIdField () {
+        ToolingAPI toolingAPI = new ToolingAPI();
+        ToolingAPIWSDL.sObject_x[] customFields = toolingAPI.queryAll('SELECT TableEnumOrId FROM CustomField Where DeveloperName = \''+ SALTO_ID_FIELD_DEVELOPER_NAME + '\'').records;
         Set<String> objectsWithSaltoIdField = new Set<String>();
-        for(MetadataService.FileProperties fileProperty : fileProperties) {
-            String[] nameParts = fileProperty.fullName.split('\\.');
-            if (nameParts.size() == 2 && nameParts[1].equals(SALTO_ID_FIELD_API_NAME)) {
-                objectsWithSaltoIdField.add(nameParts[0]);
-            }
-        }
+        for (ToolingAPIWSDL.sObject_x field : customFields) {
+            objectsWithSaltoIdField.add(field.TableEnumOrId);
+        }   
         return objectsWithSaltoIdField;
     }
 
@@ -66,7 +61,7 @@ public class SaltoExternalIdService {
         }
     }
 
-    public static void addSaltoIdField(Set<String> objectNames, Set<String> flsProfiles) {
+    public static void createSaltoIdField(Set<String> objectNames, Set<String> flsProfiles) {
         Set<String> objectsToHandle = new Set<String>(objectNames);
         objectsToHandle.removeAll(getObjectsWithSaltoIdField());
         if (objectsToHandle.isEmpty()) {
@@ -79,7 +74,7 @@ public class SaltoExternalIdService {
 
         MetadataService.Metadata[] fields = new MetadataService.Metadata[]{};
         MetadataService.Metadata[] profiles = new MetadataService.Metadata[]{};
-        // Create CustomField and ApexTrigger changes
+        // Create CustomField changes
         for (String objectName: objectsToHandle) {
             fields.add(getField(objectName));
         }
@@ -96,17 +91,12 @@ public class SaltoExternalIdService {
         handleSaveResults('modified', 'Profile', profileResults);
     }
 
-    private static Set<String> getAllTriggerNames() {
-        MetadataService.MetadataPort service = createService();
-        List<MetadataService.ListMetadataQuery> queries = new List<MetadataService.ListMetadataQuery>();		
-		MetadataService.ListMetadataQuery apexTriggerQuery = new MetadataService.ListMetadataQuery();
-		apexTriggerQuery.type_x = 'ApexTrigger';
-		queries.add(apexTriggerQuery);
-        Set<String> customFieldsFullNames = new Set<String>();
-        MetadataService.FileProperties[] fileProperties = service.listMetadata(queries, 25);
+    public static Set<String> getObjectsWithExistingTrigger() {
+        String query = 'SELECT TableEnumOrId FROM ApexTrigger WHERE Name Like \'%' + TRIGGER_SUFFIX  + '\'';
+        List<ApexTrigger> apexTriggers = Database.query(query);
         Set<String> triggerNames = new Set<String>();
-        for(MetadataService.FileProperties fileProperty : fileProperties) {
-            triggerNames.add(fileProperty.fullName);
+        for(ApexTrigger apexTrigger: apexTriggers) {
+            triggerNames.add(apexTrigger.TableEnumOrId);
         }
         return triggerNames;
     }
@@ -117,10 +107,10 @@ public class SaltoExternalIdService {
             triggerNamePrefix = triggerNamePrefix.replaceAll('__c', '');
         }
         triggerNamePrefix = triggerNamePrefix.replaceAll('_', '');
-        return triggerNamePrefix + 'SaltoId' + 'Trigger';
+        return triggerNamePrefix + TRIGGER_SUFFIX;
     }
 
-    private class ApexTrigger {
+    private class ApexTriggerMetadata {
         public String fullName;
         public Double apiVersion;
         public String status;
@@ -128,22 +118,21 @@ public class SaltoExternalIdService {
         public String content;
     }
 
-    private static ApexTrigger getTrigger(String objectName) {
+    private static ApexTriggerMetadata getTrigger(String objectName) {
         String triggerName = triggerNameFromObject(objectName);
-        ApexTrigger metadataTrigger = new ApexTrigger();
+        ApexTriggerMetadata metadataTrigger = new ApexTriggerMetadata();
         metadataTrigger.fullName = triggerName;
         metadataTrigger.parentObject = objectName;
         metadataTrigger.apiVersion = API_VERSION;
         metadataTrigger.status = 'Active';
         metadataTrigger.content = 'trigger ' + triggerName + ' on ' + objectName + ' (after insert) {\n';
-        metadataTrigger.content += '    SaltoInternalId.updateSaltoId(Trigger.new);\n';
+        metadataTrigger.content += '    SaltoExternalIdService.updateSaltoId(Trigger.new);\n';
         metadataTrigger.content += '}';
         return metadataTrigger;
     }
 
-    public static void createTrigger(ApexTrigger apexTrigger) {
+    public static void createTrigger(ApexTriggerMetadata apexTrigger) {
         String toolingApiEndpoint = System.Url.getOrgDomainUrl().toExternalForm() + '/services/data/v' + API_VERSION + '/tooling/sobjects/ApexTrigger';
-        System.debug('Tooling API endpoint: ' + toolingApiEndpoint);
         
         HttpRequest req = new HttpRequest();
         req.setEndpoint(toolingApiEndpoint);
@@ -156,45 +145,37 @@ public class SaltoExternalIdService {
         payload.put('Name', apexTrigger.fullName);
         payload.put('TableEnumOrId', apexTrigger.parentObject);
         payload.put('Body', apexTrigger.content);
+        payload.put('Status', apexTrigger.status);
+        payload.put('ApiVersion', apexTrigger.apiVersion);
         req.setBody(JSON.serialize(payload));
 
         Http http = new Http();
         try {
             HttpResponse res = http.send(req);
             if (res.getStatusCode() == 201) {
-                System.debug('Trigger deployed successfully');
+                System.debug('Trigger ' + apexTrigger.fullName +  ' created successfully');
             } else {
-                System.debug('Failed to deploy trigger: ' + res.getBody());
+                System.debug('Failed to deploy trigger ' + apexTrigger.fullName + ': ' + res.getBody());
             }
         } catch (Exception e) {
-            System.debug('Exception: ' + e.getMessage());
+            System.debug('Exception occurred when attempting to create trigger' + apexTrigger.fullName + ': ' + e.getMessage());
         }
     }
 
-    public static void addSaltoIdFieldTriggers() {
+    public static void createSaltoIdFieldTriggers() {
         Set<String> objectsWithSaltoIdField = getObjectsWithSaltoIdField();
-        if (objectsWithSaltoIdField.isEmpty()) {
-            System.debug('No objects with Salto ID field');
-            return;
-        }
-        ApexTrigger[] triggers = new ApexTrigger[]{};
+        ApexTriggerMetadata[] triggers = new ApexTriggerMetadata[]{};
+        Set<String> objectsWithExistingTrigger = getObjectsWithExistingTrigger();
         for (String objectName: objectsWithSaltoIdField) {
-            triggers.add(getTrigger(objectName));
-        }
-        Set<String> existingTriggersNames = getAllTriggerNames();
-        ApexTrigger[] triggersToAdd = new ApexTrigger[]{};
-        for (ApexTrigger apexTrigger: triggers) {
-            if (existingTriggersNames.contains(apexTrigger.fullName)) {
-                System.debug('Trigger ' + apexTrigger.fullName + ' already exists');
-            } else {
-                triggersToAdd.add(apexTrigger);
+            if (!objectsWithExistingTrigger.contains(objectName)) {
+                triggers.add(getTrigger(objectName));
             }
         }
-        if (triggersToAdd.isEmpty()) {
+        if (triggers.isEmpty()) {
             System.debug('No triggers to add');
             return;
         }
-        for (ApexTrigger apexTrigger: triggersToAdd) {
+        for (ApexTriggerMetadata apexTrigger: triggers) {
             createTrigger(apexTrigger);
         }
     }
@@ -223,6 +204,13 @@ public class SaltoExternalIdService {
         // Perform the update outside the loop
         if (!recordsToUpdate.isEmpty()) {
             update recordsToUpdate;
+        }
+    }
+
+    public static void updateExistingRecordsSaltoIdField() {
+        for (String objectName: getObjectsWithSaltoIdField()) {
+            List<SObject> records = Database.query('SELECT Id, ' + SALTO_ID_FIELD_API_NAME + ' FROM ' + objectName + ' WHERE ' + SALTO_ID_FIELD_API_NAME + ' = null');
+            updateSaltoId(records);
         }
     }
 }
